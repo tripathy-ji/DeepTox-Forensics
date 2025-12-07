@@ -2,8 +2,5 @@
 venv/
 __pycache__/
 .vscode/
-data/
-*.sdf
-*.zip
 *.png
 "@ | Out-File -FilePath .gitignore -Encoding UTF8

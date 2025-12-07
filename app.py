@@ -1,28 +1,31 @@
-import streamlit as st
+import os
 import torch
 import torch.nn as nn
-import numpy as np
+from flask import Flask, render_template, request, jsonify
 from rdkit import Chem
 from rdkit.Chem import rdFingerprintGenerator
-import os
+import numpy as np
 
-# --- 1. SETUP PAGE ---
-st.set_page_config(page_title="DeepTox Forensics", page_icon="🧪")
+app = Flask(__name__)
 
-st.title("🧪 DeepTox Forensic Scanner")
-st.write("Predict chemical toxicity (NR-AhR) using Deep Learning.")
-
-# --- 2. MODEL ARCHITECTURE (Must match training) ---
+# ==========================================
+# 1. DEFINE MODEL ARCHITECTURE
+# ==========================================
+# This MUST match the class used in train_tox.py exactly
 class ToxNet(nn.Module):
     def __init__(self):
         super(ToxNet, self).__init__()
+        # Layer 1
         self.layer1 = nn.Linear(2048, 1024)
         self.bn1 = nn.BatchNorm1d(1024)
         self.dropout1 = nn.Dropout(0.4)
+        # Layer 2
         self.layer2 = nn.Linear(1024, 256)
         self.bn2 = nn.BatchNorm1d(256)
         self.dropout2 = nn.Dropout(0.3)
+        # Layer 3
         self.layer3 = nn.Linear(256, 1)
+        
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
 
@@ -32,50 +35,77 @@ class ToxNet(nn.Module):
         x = self.sigmoid(self.layer3(x))
         return x
 
-# --- 3. LOAD MODEL ---
-@st.cache_resource
-def load_model():
-    device = torch.device("cpu") # Cloud servers use CPU usually
-    model = ToxNet().to(device)
-    
-    # Load weights
-    if os.path.exists("best_tox_model.pth"):
-        model.load_state_dict(torch.load("best_tox_model.pth", map_location=device))
-    else:
-        st.error("Model file not found! Please upload best_tox_model.pth.")
-        return None
-    
-    model.eval()
-    return model
+# ==========================================
+# 2. LOAD MODEL AND CONFIGURATION
+# ==========================================
+DEVICE = torch.device("cpu") # Cloud servers use CPU
+MODEL_PATH = "best_tox_model.pth"
 
-model = load_model()
+# Initialize model
+model = ToxNet().to(DEVICE)
+
+# Setup Fingerprint Generator (New Method - No Warnings)
 morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
-# --- 4. UI & PREDICTION ---
-input_smiles = st.text_input("Enter SMILES String:", placeholder="e.g. CCO")
+# Load weights
+if os.path.exists(MODEL_PATH):
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        print(f"✅ Successfully loaded weights from {MODEL_PATH}")
+    except Exception as e:
+        print(f"❌ Error loading weights: {e}")
+        print("Did you change the ToxNet class? It must match train_tox.py exactly.")
+else:
+    print(f"⚠️ Warning: {MODEL_PATH} not found. Predictions will be random.")
 
-if st.button("Analyze Toxicity"):
-    if not input_smiles:
-        st.warning("Please enter a chemical string.")
-    else:
-        mol = Chem.MolFromSmiles(input_smiles)
-        if mol is None:
-            st.error("Invalid Chemical Structure.")
-        else:
-            # Visualize
-            st.image(Chem.Draw.MolToImage(mol), caption="Chemical Structure", width=300)
+model.eval()
+
+# ==========================================
+# 3. FLASK ROUTES
+# ==========================================
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.get_json()
+    smiles = data.get('smiles', '').strip()
+
+    if not smiles:
+        return jsonify({'error': 'Please enter a SMILES string.'}), 400
+
+    # Process Molecule
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return jsonify({'error': 'Invalid Chemical Structure.'}), 400
+
+    # Generate Fingerprint (The Modern Way)
+    fp = morgan_gen.GetFingerprint(mol)
+    np_fp = np.array(fp, dtype=np.float32)
+    
+    # Add batch dimension (1, 2048)
+    input_tensor = torch.tensor(np_fp).unsqueeze(0).to(DEVICE)
+
+    # Inference
+    try:
+        with torch.no_grad():
+            prediction = model(input_tensor)
+            probability = prediction.item()
             
-            # Predict
-            fp = morgan_gen.GetFingerprint(mol)
-            np_fp = np.array(fp, dtype=np.float32)
-            tensor_fp = torch.FloatTensor(np_fp).unsqueeze(0) # CPU tensor
+            # Forensic Threshold logic
+            is_toxic = probability > 0.50
+            label = "TOXIC" if is_toxic else "SAFE"
             
-            with torch.no_grad():
-                output = model(tensor_fp)
-                prob = output.item()
+            return jsonify({
+                'smiles': smiles,
+                'prediction': label,
+                'probability': f"{probability:.4f}",
+                'is_toxic': is_toxic
+            })
             
-            percent = prob * 100
-            if percent > 50:
-                st.error(f"🔴 TOXIC DETECTED ({percent:.2f}%)")
-            else:
-                st.success(f"🟢 SAFE ({percent:.2f}%)")
+    except Exception as e:
+        return jsonify({'error': f"Inference error: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
